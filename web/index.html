@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LAN Clipboard Web</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="card">
+        <p class="eyebrow">LAN clipboard</p>
+        <h1>Shared Clipboard</h1>
+        <label for="serverHost">Manual WebSocket URL fallback</label>
+        <div class="server-config">
+          <input id="serverHost" type="text" placeholder="ws://clipboard-share.local:8080, 192.168.1.10, or mac-mini.local">
+          <button id="saveServerButton" type="button">Use Manual URL</button>
+        </div>
+        <p class="hint">This client first tries Bonjour/mDNS via the server's <code>.local</code> hostname, then other LAN discovery candidates. Enter a host, IP, or full <code>ws://</code>/<code>wss://</code> URL only if auto-discovery cannot reach the server.</p>
+        <p id="connectionStatus" class="status">Waiting for server address</p>
+        <label for="clipboardText">Current text</label>
+        <textarea id="clipboardText" rows="10" placeholder="Shared clipboard text"></textarea>
+        <div class="actions">
+          <button id="pushButton" type="button">Update Shared Clipboard</button>
+          <button id="copyButton" type="button">Copy To Local Clipboard</button>
+        </div>
+        <p id="updatedAt" class="timestamp">No updates yet</p>
+      </section>
+    </main>
+    <script src="discovery.js"></script>
+    <script src="app.js"></script>
+  </body>
+  </html>

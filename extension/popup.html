@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LAN Clipboard Sync</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="popup">
+      <h1>LAN Clipboard Sync</h1>
+      
+      <div class="server-config">
+        <label for="serverUrl">Manual WebSocket fallback</label>
+        <input type="text" id="serverUrl" placeholder="ws://clipboard-share.local:8080, 192.168.1.10, or mac-mini.local">
+        <button id="saveServerUrl" type="button">Save Fallback</button>
+      </div>
+      <p class="status">Leave the field blank to let the extension prefer <code>clipboard-share.local</code> and LAN discovery automatically.</p>
+
+      <p id="status" class="status">Connecting...</p>
+      <label for="clipboardText">Shared text</label>
+      <textarea id="clipboardText" rows="8" placeholder="Clipboard text appears here"></textarea>
+      <div class="buttons">
+        <button id="syncFromClipboard" type="button">Sync From Local</button>
+        <button id="pushToServer" type="button">Push To Server</button>
+        <button id="copyFromServer" type="button">Copy From Server</button>
+      </div>
+      <p id="updatedAt" class="updated-at"></p>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+  </html>

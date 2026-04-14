@@ -1,0 +1,14 @@
+{
+  "name": "lan-clipboard-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "LAN clipboard sharing WebSocket server",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "bonjour": "^3.5.0",
+    "ws": "^8.18.0"
+  }
+}
