@@ -6,28 +6,43 @@
     <title>LAN Clipboard Web</title>
     <link rel="stylesheet" href="styles.css">
   </head>
-  <body>
+  <body class="mobile-optimized">
     <main class="app">
       <section class="card">
-        <p class="eyebrow">LAN clipboard</p>
-        <h1>Shared Clipboard</h1>
-        <label for="serverHost">Manual WebSocket URL fallback</label>
+        <div class="hero">
+          <div>
+            <p class="eyebrow">LAN clipboard</p>
+            <h1>Shared Clipboard</h1>
+            <p class="subhead">Instant clipboard sync across your local network, with automatic fallback when one route fails.</p>
+          </div>
+          <p id="connectionStatus" class="status-pill" data-state="connecting">Initializing…</p>
+        </div>
+
         <div class="server-config">
-          <input id="serverHost" type="text" placeholder="ws://clipboard-share.local:8080, 192.168.1.10, or mac-mini.local">
-          <button id="saveServerButton" type="button">Use Manual URL</button>
+          <label for="serverHost">Preferred Server</label>
+          <div class="input-shell">
+            <span class="input-prefix">LAN</span>
+            <input id="serverHost" type="text" spellcheck="false" autocomplete="off" placeholder="Type a hostname, IP, or ws:// URL">
+            <button id="saveServerButton" type="button" class="secondary">Auto</button>
+          </div>
+          <p class="hint">Type any valid host and the app connects immediately. Leave it blank to stay on zero-touch discovery.</p>
         </div>
-        <p class="hint">This client first tries Bonjour/mDNS via the server's <code>.local</code> hostname, then other LAN discovery candidates. Enter a host, IP, or full <code>ws://</code>/<code>wss://</code> URL only if auto-discovery cannot reach the server.</p>
-        <p id="connectionStatus" class="status">Waiting for server address</p>
-        <label for="clipboardText">Current text</label>
-        <textarea id="clipboardText" rows="10" placeholder="Shared clipboard text"></textarea>
+
+        <div class="clipboard-panel">
+          <div class="panel-head">
+            <label for="clipboardText">Current text</label>
+            <p id="updatedAt" class="timestamp"></p>
+          </div>
+          <textarea id="clipboardText" rows="10" placeholder="Shared clipboard text"></textarea>
+        </div>
+
         <div class="actions">
-          <button id="pushButton" type="button">Update Shared Clipboard</button>
-          <button id="copyButton" type="button">Copy To Local Clipboard</button>
+          <button id="pushButton" type="button" class="primary">Share to LAN</button>
+          <button id="copyButton" type="button" class="secondary">Copy Local</button>
         </div>
-        <p id="updatedAt" class="timestamp">No updates yet</p>
       </section>
     </main>
     <script src="discovery.js"></script>
     <script src="app.js"></script>
   </body>
-  </html>
+</html>

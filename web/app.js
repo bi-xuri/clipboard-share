@@ -1,3 +1,5 @@
+const discoveryApi = window.LanClipboardDiscovery || {};
+
 const statusEl = document.getElementById("connectionStatus");
 const textEl = document.getElementById("clipboardText");
 const updatedAtEl = document.getElementById("updatedAt");
@@ -5,45 +7,129 @@ const serverHostEl = document.getElementById("serverHost");
 const saveServerButtonEl = document.getElementById("saveServerButton");
 
 const SERVER_HOST_STORAGE_KEY = "lanClipboardServerHost";
+const DEFAULT_MDNS_HOSTNAME = discoveryApi.DEFAULT_MDNS_HOSTNAME || "clipboard-share.local";
 const DISCOVERY_TIMEOUT_MS = 1500;
+const RECONNECT_DELAY_MS = 1800;
+const CONNECT_TIMEOUT_MS = 2500;
+const MANUAL_INPUT_DEBOUNCE_MS = 420;
 
-const {
-  DEFAULT_MDNS_HOSTNAME,
-  buildAutomaticConnectionCandidates,
-  buildConnectionCandidates,
-  normalizeServerUrl
-} = window.LanClipboardDiscovery;
+const normalizeServerUrl = discoveryApi.normalizeServerUrl || fallbackNormalizeServerUrl;
+const buildConnectionCandidates = discoveryApi.buildConnectionCandidates || fallbackBuildConnectionCandidates;
+const buildAutomaticConnectionCandidates = discoveryApi.buildAutomaticConnectionCandidates || fallbackBuildAutomaticConnectionCandidates;
 
-let socket;
-let reconnectTimer = null;
-let shouldReconnect = true;
-let currentServerUrl = "";
-let reconnectAttemptUrl = "";
+let socket = null;
 let isConnecting = false;
+let queuedConnectOptions = null;
+let reconnectTimer = null;
+let inputTimer = null;
+let shouldReconnect = true;
 let reconnectMode = "auto";
-let queuedConnectMode = null;
+let currentServerUrl = "";
+let connectRunId = 0;
 
-function setStatus(text) {
-  statusEl.textContent = text;
+let lastRequestedManualHost = "";
+let clipboardText = "";
+let lastUpdatedAt = null;
+
+function fallbackNormalizeServerUrl(host, protocol) {
+  if (!host) return "";
+  const trimmed = String(host).trim();
+  if (!trimmed) return "";
+
+  const rawValue = /^[a-z]+:\/\//i.test(trimmed) ? trimmed : `${protocol}://${trimmed}`;
+
+  try {
+    const parsed = new URL(rawValue);
+    if (parsed.protocol === "http:") parsed.protocol = "ws:";
+    if (parsed.protocol === "https:") parsed.protocol = "wss:";
+    if (!parsed.port) parsed.port = "8080";
+    parsed.pathname = "/";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/$/, "");
+  } catch (error) {
+    return "";
+  }
 }
 
-function setClipboardText(text, updatedAt) {
-  textEl.value = text;
-  updatedAtEl.textContent = updatedAt
-    ? `Last update: ${new Date(updatedAt).toLocaleString()}`
-    : "Last update: none";
+function fallbackBuildConnectionCandidates({ manualValue = "", pageHostname = "", protocol = "ws", mdnsHostname = DEFAULT_MDNS_HOSTNAME }) {
+  const candidates = [];
+  if (manualValue) candidates.push(normalizeServerUrl(manualValue, protocol));
+  candidates.push(normalizeServerUrl(mdnsHostname, protocol));
+  if (pageHostname && pageHostname !== "localhost") {
+    candidates.push(normalizeServerUrl(pageHostname, protocol));
+  }
+  return [...new Set(candidates.filter(Boolean))];
 }
 
-function getInitialServerHost() {
-  return window.localStorage.getItem(SERVER_HOST_STORAGE_KEY) || "";
+function fallbackBuildAutomaticConnectionCandidates({ pageHostname = "", protocol = "ws", mdnsHostname = DEFAULT_MDNS_HOSTNAME }) {
+  return fallbackBuildConnectionCandidates({ pageHostname, protocol, mdnsHostname });
+}
+
+function getDefaultUrlProtocol() {
+  return window.location.protocol === "https:" ? "wss" : "ws";
 }
 
 function getPreferredManualValue() {
-  return serverHostEl.value.trim() || window.localStorage.getItem(SERVER_HOST_STORAGE_KEY) || "";
+  return window.localStorage.getItem(SERVER_HOST_STORAGE_KEY) || "";
+}
+
+function getInitialServerHost() {
+  return getPreferredManualValue();
+}
+
+function getConnectionLabel(serverUrl) {
+  try {
+    return new URL(serverUrl).host;
+  } catch (error) {
+    return serverUrl;
+  }
+}
+
+function setStatus(text, state = "idle") {
+  statusEl.textContent = text;
+  statusEl.dataset.state = state;
+}
+
+function setClipboardText(text, updatedAt) {
+  clipboardText = text;
+  lastUpdatedAt = updatedAt;
+  textEl.value = text;
+  updatedAtEl.textContent = updatedAt ? `Last synced ${new Date(updatedAt).toLocaleTimeString()}` : "";
+}
+
+function closeSocket() {
+  if (!socket) return;
+
+  const activeSocket = socket;
+  socket = null;
+  activeSocket.onopen = null;
+  activeSocket.onmessage = null;
+  activeSocket.onclose = null;
+  activeSocket.onerror = null;
+
+  if (activeSocket.readyState === WebSocket.OPEN || activeSocket.readyState === WebSocket.CONNECTING) {
+    activeSocket.close();
+  }
+}
+
+function clearReconnectTimer() {
+  if (!reconnectTimer) return;
+  window.clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+}
+
+function queueReconnect() {
+  if (!shouldReconnect || reconnectTimer) return;
+
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    connect({ mode: reconnectMode });
+  }, RECONNECT_DELAY_MS);
 }
 
 async function fetchDiscoveryPayload() {
-  if (!/^https?:$/.test(window.location.protocol)) {
+  if (!window.location.protocol.startsWith("https")) {
     return null;
   }
 
@@ -56,10 +142,7 @@ async function fetchDiscoveryPayload() {
       signal: controller.signal
     });
 
-    if (!response.ok) {
-      return null;
-    }
-
+    if (!response.ok) return null;
     return await response.json();
   } catch (error) {
     return null;
@@ -68,28 +151,26 @@ async function fetchDiscoveryPayload() {
   }
 }
 
-function getDefaultUrlProtocol() {
-  return window.location.protocol === "https:" ? "wss" : "ws";
+function isValidManualHost(value) {
+  return Boolean(normalizeServerUrl(value, getDefaultUrlProtocol()));
 }
 
-function queueReconnect() {
-  if (!shouldReconnect || reconnectTimer) {
-    return;
-  }
-
-  reconnectTimer = window.setTimeout(() => {
-    reconnectTimer = null;
-    connect({ mode: reconnectMode });
-  }, 2000);
+function updateInputState() {
+  const value = serverHostEl.value.trim();
+  const state = value ? (isValidManualHost(value) ? "valid" : "invalid") : "empty";
+  serverHostEl.dataset.state = state;
 }
 
-async function connect({ mode = "auto" } = {}) {
+async function connect({ mode = "auto", preferredHost = getPreferredManualValue(), force = false } = {}) {
   if (isConnecting) {
-    queuedConnectMode = mode;
+    queuedConnectOptions = { mode, preferredHost, force };
     return;
   }
 
   isConnecting = true;
+  const runId = ++connectRunId;
+  clearReconnectTimer();
+
   let candidates;
 
   try {
@@ -101,91 +182,144 @@ async function connect({ mode = "auto" } = {}) {
       mdnsHostname: discoveryPayload?.mdns?.hostname || DEFAULT_MDNS_HOSTNAME
     };
 
-    candidates = mode === "manual"
-      ? buildConnectionCandidates({
-        manualValue: getPreferredManualValue(),
-        ...options
-      })
+    candidates = mode === "manual" && preferredHost
+      ? buildConnectionCandidates({ manualValue: preferredHost, ...options })
       : buildAutomaticConnectionCandidates(options);
   } finally {
     isConnecting = false;
   }
 
-  if (queuedConnectMode) {
-    const nextMode = queuedConnectMode;
-    queuedConnectMode = null;
-    connect({ mode: nextMode });
+  if (queuedConnectOptions) {
+    const nextOptions = queuedConnectOptions;
+    queuedConnectOptions = null;
+    connect(nextOptions);
     return;
   }
 
-  if (candidates.length === 0) {
-    setStatus("Auto-discovery found no server. Enter a WebSocket URL, host, or .local name to connect manually.");
+  if (runId !== connectRunId) {
     return;
   }
 
-  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
-
-  reconnectMode = mode;
-  attemptConnection(candidates, 0, mode);
-}
-
-function attemptConnection(candidates, index, mode) {
-  const serverUrl = candidates[index];
-  let didOpen = false;
-  const attemptLabel = mode === "manual" ? "manual fallback" : "auto-discovery";
-
-  reconnectAttemptUrl = serverUrl;
-  setStatus(`Using ${attemptLabel}: connecting to ${serverUrl}`);
-
-  try {
-    socket = new WebSocket(serverUrl);
-  } catch (error) {
-    socket = null;
-
-    if (index + 1 < candidates.length) {
-      setStatus(`Unable to open ${serverUrl}. Trying ${candidates[index + 1]}...`);
-      attemptConnection(candidates, index + 1, mode);
-      return;
-    }
-
-    const fallbackHint = mode === "manual"
-      ? "Check the URL and try again."
-      : "Enter a WebSocket URL manually if mDNS cannot resolve.";
-    setStatus(`Unable to open ${serverUrl}. ${fallbackHint}`);
+  if (!candidates || candidates.length === 0) {
+    setStatus("No LAN clipboard server found yet.", "error");
     queueReconnect();
     return;
   }
 
-  socket.addEventListener("open", () => {
+  reconnectMode = mode;
+
+  if (socket && !force && socket.readyState === WebSocket.OPEN && candidates.includes(currentServerUrl)) {
+    setStatus(`Connected to ${getConnectionLabel(currentServerUrl)}`, "connected");
+    return;
+  }
+
+  closeSocket();
+  attemptConnection({
+    candidates,
+    index: 0,
+    mode,
+    runId
+  });
+}
+
+function attemptConnection({ candidates, index, mode, runId }) {
+  if (runId !== connectRunId) {
+    return;
+  }
+
+  const serverUrl = candidates[index];
+
+  if (!serverUrl) {
+    setStatus("No reachable LAN clipboard host responded.", "error");
+    queueReconnect();
+    return;
+  }
+
+  const label = getConnectionLabel(serverUrl);
+  let didOpen = false;
+  let initialSyncReceived = false;
+  let timeoutId = null;
+  let localSocket = null;
+
+  setStatus(`Connecting to ${label}…`, "connecting");
+
+  try {
+    localSocket = new WebSocket(serverUrl);
+  } catch (error) {
+    if (index + 1 < candidates.length) {
+      attemptConnection({ candidates, index: index + 1, mode, runId });
+      return;
+    }
+
+    setStatus(`Unable to connect to ${label}. Retrying in the background…`, "error");
+    queueReconnect();
+    return;
+  }
+
+  socket = localSocket;
+
+  timeoutId = window.setTimeout(() => {
+    if (didOpen || runId !== connectRunId || socket !== localSocket) {
+      return;
+    }
+
+    setStatus(`Timed out on ${label}. Trying the next route…`, "connecting");
+    localSocket.close();
+  }, CONNECT_TIMEOUT_MS);
+
+  localSocket.onopen = () => {
+    if (runId !== connectRunId || socket !== localSocket) {
+      localSocket.close();
+      return;
+    }
+
     didOpen = true;
     currentServerUrl = serverUrl;
-    reconnectAttemptUrl = "";
-    setStatus(`Connected to ${serverUrl} via ${attemptLabel}`);
-  });
+    setStatus(`Connected to ${label}. Syncing latest clipboard…`, "connected");
+  };
 
-  socket.addEventListener("message", (event) => {
+  localSocket.onmessage = (event) => {
+    if (runId !== connectRunId || socket !== localSocket) {
+      return;
+    }
+
     let message;
-
     try {
       message = JSON.parse(event.data);
     } catch (error) {
-      setStatus("Received invalid message from server");
       return;
     }
 
     if (message.type === "init" || message.type === "clipboard" || message.type === "ack") {
+      initialSyncReceived = true;
       setClipboardText(message.text || "", message.updatedAt);
+      setStatus(`Connected to ${label}`, "connected");
       return;
     }
 
-    if (message.type === "error" && message.message) {
-      setStatus(`Server error: ${message.message}`);
+    if (message.type === "error") {
+      setStatus(`Server error: ${message.message}`, "error");
     }
-  });
+  };
 
-  socket.addEventListener("close", () => {
+  localSocket.onerror = () => {
+    if (runId !== connectRunId || socket !== localSocket) {
+      return;
+    }
+
+    setStatus(`Connection issue on ${label}. Trying another route…`, "connecting");
+  };
+
+  localSocket.onclose = () => {
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+
+    if (runId !== connectRunId || socket !== localSocket) {
+      return;
+    }
+
     socket = null;
 
     if (!shouldReconnect) {
@@ -193,110 +327,115 @@ function attemptConnection(candidates, index, mode) {
     }
 
     if (!didOpen && index + 1 < candidates.length) {
-      setStatus(`Unable to reach ${serverUrl}. Trying ${candidates[index + 1]}...`);
-      attemptConnection(candidates, index + 1, mode);
+      attemptConnection({ candidates, index: index + 1, mode, runId });
       return;
     }
 
-    const disconnectedUrl = reconnectAttemptUrl || currentServerUrl;
-    if (!didOpen) {
-      const retryMessage = mode === "manual"
-        ? `Manual connection failed for ${disconnectedUrl || serverUrl}. Retrying...`
-        : `Auto-discovery could not reach ${disconnectedUrl || serverUrl}. Retrying clipboard-share.local:8080 and LAN fallbacks...`;
-      setStatus(retryMessage);
-    } else {
-      setStatus(disconnectedUrl ? `Disconnected from ${disconnectedUrl}. Retrying...` : "Disconnected. Retrying...");
-    }
-    queueReconnect();
-  });
+    currentServerUrl = "";
 
-  socket.addEventListener("error", () => {
-    setStatus(`Connection error${serverUrl ? ` (${serverUrl})` : ""}`);
-    socket.close();
-  });
+    if (didOpen && !initialSyncReceived) {
+      setStatus(`Connected, but initial sync was interrupted. Reconnecting…`, "connecting");
+    } else {
+      setStatus(`Disconnected. Reconnecting in the background…`, "connecting");
+    }
+
+    queueReconnect();
+  };
 }
 
-function saveServerHost() {
-  const host = serverHostEl.value.trim();
-  const normalizedHost = normalizeServerUrl(host, getDefaultUrlProtocol());
+function scheduleManualConnect() {
+  const manualHost = serverHostEl.value.trim();
+  updateInputState();
+  clearReconnectTimer();
 
-  if (host && !normalizedHost) {
-    setStatus("Enter a valid host, IP, http(s) URL, or ws(s) URL");
-    return;
+  if (inputTimer) {
+    window.clearTimeout(inputTimer);
   }
 
-  if (!host) {
-    window.localStorage.removeItem(SERVER_HOST_STORAGE_KEY);
-    queuedConnectMode = null;
-    setStatus("Manual fallback cleared. Auto-discovery will keep trying the server's .local name and LAN endpoints.");
+  inputTimer = window.setTimeout(() => {
+    const latestValue = serverHostEl.value.trim();
 
-    shouldReconnect = false;
-
-    if (reconnectTimer) {
-      window.clearTimeout(reconnectTimer);
-      reconnectTimer = null;
+    if (!latestValue) {
+      window.localStorage.removeItem(SERVER_HOST_STORAGE_KEY);
+      lastRequestedManualHost = "";
+      connect({ mode: "auto", force: true });
+      return;
     }
 
-    if (socket) {
-      socket.close();
-      socket = null;
+    const normalizedHost = normalizeServerUrl(latestValue, getDefaultUrlProtocol());
+
+    if (!normalizedHost) {
+      setStatus("Keep typing a valid hostname, IP, or WebSocket URL.", "error");
+      return;
     }
 
-    shouldReconnect = true;
-    connect({ mode: "auto" });
-    return;
-  }
+    if (latestValue === lastRequestedManualHost && currentServerUrl === normalizedHost && socket?.readyState === WebSocket.OPEN) {
+      setStatus(`Connected to ${getConnectionLabel(normalizedHost)}`, "connected");
+      return;
+    }
 
-  window.localStorage.setItem(SERVER_HOST_STORAGE_KEY, host);
+    window.localStorage.setItem(SERVER_HOST_STORAGE_KEY, latestValue);
+    lastRequestedManualHost = latestValue;
+    connect({ mode: "manual", preferredHost: latestValue, force: true });
+  }, MANUAL_INPUT_DEBOUNCE_MS);
+}
 
-  shouldReconnect = false;
-
-  if (reconnectTimer) {
-    window.clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-
-  if (socket) {
-    socket.close();
-    socket = null;
-  }
-
-  shouldReconnect = true;
-  connect({ mode: "manual" });
+function resetToAutomaticDiscovery() {
+  serverHostEl.value = "";
+  updateInputState();
+  window.localStorage.removeItem(SERVER_HOST_STORAGE_KEY);
+  lastRequestedManualHost = "";
+  setStatus("Automatic LAN discovery enabled.", "connecting");
+  connect({ mode: "auto", force: true });
 }
 
 document.getElementById("pushButton").addEventListener("click", () => {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    setStatus("Server is not connected");
+    setStatus("Not connected to a LAN clipboard server.", "error");
     return;
   }
 
-  socket.send(
-    JSON.stringify({
-      type: "setClipboard",
-      text: textEl.value
-    })
-  );
-  setStatus(`Shared clipboard updated via ${currentServerUrl || reconnectAttemptUrl}`);
+  socket.send(JSON.stringify({ type: "setClipboard", text: textEl.value }));
+  setStatus("Shared to the LAN clipboard.", "connected");
 });
 
 document.getElementById("copyButton").addEventListener("click", async () => {
   try {
-    await navigator.clipboard.writeText(textEl.value);
-    setStatus("Copied current text to local clipboard");
-  } catch (error) {
-    setStatus("Clipboard write failed");
+    const text = textEl.value;
+    if (!text) return;
+    await navigator.clipboard.writeText(text);
+    setStatus("Copied to your local clipboard.", "connected");
+  } catch (err) {
+    console.error("Failed to copy: ", err);
+    // Fallback for environments where navigator.clipboard might be restricted
+    try {
+      const textArea = document.createElement("textarea");
+      textArea.value = textEl.value;
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textArea);
+      setStatus("Copied to your local clipboard (fallback).", "connected");
+    } catch (fallbackErr) {
+      console.error("Fallback copy failed: ", fallbackErr);
+      setStatus("Copy failed. Please select and copy manually.", "error");
+    }
   }
 });
 
-saveServerButtonEl.addEventListener("click", saveServerHost);
-
+saveServerButtonEl.addEventListener("click", resetToAutomaticDiscovery);
+serverHostEl.addEventListener("input", scheduleManualConnect);
 serverHostEl.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
-    saveServerHost();
+    event.preventDefault();
+    scheduleManualConnect();
   }
 });
 
 serverHostEl.value = getInitialServerHost();
-setStatus(`Auto-discovery will try Bonjour at ${DEFAULT_MDNS_HOSTNAME} before falling back to LAN addresses.`);
-connect({ mode: "auto" });
+lastRequestedManualHost = serverHostEl.value.trim();
+updateInputState();
+connect({
+  mode: serverHostEl.value.trim() ? "manual" : "auto",
+  preferredHost: serverHostEl.value.trim()
+});

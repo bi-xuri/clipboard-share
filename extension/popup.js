@@ -20,6 +20,14 @@ function renderState(state) {
   statusEl.textContent = currentServerUrl
     ? `Status: ${state.connectionStatus} (manual fallback: ${currentServerUrl}, connected: ${resolvedServerUrl})`
     : `Status: ${state.connectionStatus} (auto-discovery, connected: ${resolvedServerUrl})`;
+
+  if (state.connectionStatus === 'error' && !currentServerUrl) {
+    statusEl.classList.add('error');
+    statusEl.textContent = "Connection Error. Please check server or enter manual URL.";
+  } else {
+    statusEl.classList.remove('error');
+  }
+
   textEl.value = state.latestServerText || "";
   updatedAtEl.textContent = state.latestUpdatedAt
     ? `Last update: ${new Date(state.latestUpdatedAt).toLocaleString()}`

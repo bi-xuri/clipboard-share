@@ -126,7 +126,9 @@ async function fetchDiscoveryPayload(seedCandidates) {
     }
 
     try {
-      const response = await fetch(discoveryUrl, { cache: "no-store" });
+      const response = await fetch(discoveryUrl, {
+        cache: "no-store"
+      });
 
       if (response.ok) {
         return await response.json();
@@ -217,6 +219,10 @@ async function connectSocket({ mode = "auto" } = {}) {
     return;
   }
 
+  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
   reconnectMode = mode;
   attemptConnection(candidates, 0, mode);
 }
@@ -243,7 +249,11 @@ function attemptConnection(candidates, index, mode) {
       return;
     }
 
+    const fallbackHint = mode === "manual"
+      ? "Check the URL and try again."
+      : "Enter a WebSocket URL manually if mDNS cannot resolve.";
     chrome.storage.local.set({ connectionStatus: "error" });
+    setStatusWithStorage(`Unable to open ${serverUrl}. ${fallbackHint}`);
     scheduleReconnect();
     return;
   }
@@ -290,6 +300,12 @@ function attemptConnection(candidates, index, mode) {
     await chrome.storage.local.set({ connectionStatus: "error" });
     socket.close();
   });
+}
+
+async function setStatusWithStorage(text) {
+  // Since background can't update UI directly, we just store it for the next popup/page refresh
+  // or rely on the status being derived from connectionStatus in storage.
+  console.log(`[Background Status]: ${text}`);
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
