@@ -36,6 +36,17 @@
           <textarea id="clipboardText" rows="10" placeholder="Shared clipboard text"></textarea>
         </div>
 
+        <section class="file-panel card" style="margin-top: 24px; width: 100%; box-sizing: border-box;">
+          <div class="panel-head">
+            <h1 style="font-size: clamp(24px, 4vw, 32px);">Shared Files</h1>
+          </div>
+          <div id="dropZone" class="drop-zone">
+            <p>Drag & drop files here or <button id="fileInputBtn" type="button" class="secondary">click to upload</button></p>
+            <input id="fileInput" type="file" multiple style="display:none">
+          </div>
+          <ul id="fileList" class="file-list"></ul>
+        </section>
+
         <div class="actions">
           <button id="pushButton" type="button" class="primary">Share to LAN</button>
           <button id="copyButton" type="button" class="secondary">Copy Local</button>

@@ -5,6 +5,10 @@ const textEl = document.getElementById("clipboardText");
 const updatedAtEl = document.getElementById("updatedAt");
 const serverHostEl = document.getElementById("serverHost");
 const saveServerButtonEl = document.getElementById("saveServerButton");
+const dropZoneEl = document.getElementById("dropZone");
+const fileInputEl = document.getElementById("fileInput");
+const fileInputButtonEl = document.getElementById("fileInputBtn");
+const fileListEl = document.getElementById("fileList");
 
 const SERVER_HOST_STORAGE_KEY = "lanClipboardServerHost";
 const DEFAULT_MDNS_HOSTNAME = discoveryApi.DEFAULT_MDNS_HOSTNAME || "clipboard-share.local";
@@ -12,10 +16,15 @@ const DISCOVERY_TIMEOUT_MS = 1500;
 const RECONNECT_DELAY_MS = 1800;
 const CONNECT_TIMEOUT_MS = 2500;
 const MANUAL_INPUT_DEBOUNCE_MS = 420;
+const FILE_LIST_REFRESH_DEBOUNCE_MS = 250;
+const DEFAULT_FILE_PATH_PREFIX = "/files/";
+const DEFAULT_FILE_LIST_ENDPOINT = "/files";
+const DEFAULT_FILE_UPLOAD_ENDPOINT = "/upload";
 
 const normalizeServerUrl = discoveryApi.normalizeServerUrl || fallbackNormalizeServerUrl;
 const buildConnectionCandidates = discoveryApi.buildConnectionCandidates || fallbackBuildConnectionCandidates;
-const buildAutomaticConnectionCandidates = discoveryApi.buildAutomaticConnectionCandidates || fallbackBuildAutomaticConnectionCandidates;
+const buildAutomaticConnectionCandidates =
+  discoveryApi.buildAutomaticConnectionCandidates || fallbackBuildAutomaticConnectionCandidates;
 
 let socket = null;
 let isConnecting = false;
@@ -26,10 +35,36 @@ let shouldReconnect = true;
 let reconnectMode = "auto";
 let currentServerUrl = "";
 let connectRunId = 0;
+let latestFiles = [];
+let isUploading = false;
+let uploadEndpointPath = DEFAULT_FILE_UPLOAD_ENDPOINT;
+let fileListEndpointPath = DEFAULT_FILE_LIST_ENDPOINT;
+let filePathPrefix = DEFAULT_FILE_PATH_PREFIX;
+let pendingUploadRequest = null;
+let fileListRefreshTimer = null;
 
 let lastRequestedManualHost = "";
 let clipboardText = "";
 let lastUpdatedAt = null;
+
+function normalizeEndpointPath(value, fallback) {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+
+  const trimmed = value.trim();
+
+  if (!trimmed) {
+    return fallback;
+  }
+
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+function normalizePathPrefix(value, fallback) {
+  const normalized = normalizeEndpointPath(value, fallback);
+  return normalized.endsWith("/") ? normalized : `${normalized}/`;
+}
 
 function fallbackNormalizeServerUrl(host, protocol) {
   if (!host) return "";
@@ -52,17 +87,29 @@ function fallbackNormalizeServerUrl(host, protocol) {
   }
 }
 
-function fallbackBuildConnectionCandidates({ manualValue = "", pageHostname = "", protocol = "ws", mdnsHostname = DEFAULT_MDNS_HOSTNAME }) {
+function fallbackBuildConnectionCandidates({
+  manualValue = "",
+  pageHostname = "",
+  protocol = "ws",
+  mdnsHostname = DEFAULT_MDNS_HOSTNAME
+}) {
   const candidates = [];
+
   if (manualValue) candidates.push(normalizeServerUrl(manualValue, protocol));
   candidates.push(normalizeServerUrl(mdnsHostname, protocol));
+
   if (pageHostname && pageHostname !== "localhost") {
     candidates.push(normalizeServerUrl(pageHostname, protocol));
   }
+
   return [...new Set(candidates.filter(Boolean))];
 }
 
-function fallbackBuildAutomaticConnectionCandidates({ pageHostname = "", protocol = "ws", mdnsHostname = DEFAULT_MDNS_HOSTNAME }) {
+function fallbackBuildAutomaticConnectionCandidates({
+  pageHostname = "",
+  protocol = "ws",
+  mdnsHostname = DEFAULT_MDNS_HOSTNAME
+}) {
   return fallbackBuildConnectionCandidates({ pageHostname, protocol, mdnsHostname });
 }
 
@@ -86,6 +133,41 @@ function getConnectionLabel(serverUrl) {
   }
 }
 
+function getServerHttpBase() {
+  if (currentServerUrl) {
+    try {
+      const parsed = new URL(currentServerUrl);
+      parsed.protocol = parsed.protocol === "wss:" ? "https:" : "http:";
+      parsed.pathname = "/";
+      parsed.search = "";
+      parsed.hash = "";
+      return parsed.toString().replace(/\/$/, "");
+    } catch (error) {
+      return "";
+    }
+  }
+
+  if (window.location.port === "8080") {
+    return window.location.origin;
+  }
+
+  return "";
+}
+
+function buildServerHttpUrl(pathname) {
+  const baseUrl = getServerHttpBase();
+
+  if (!baseUrl) {
+    return "";
+  }
+
+  try {
+    return new URL(pathname, `${baseUrl}/`).toString();
+  } catch (error) {
+    return "";
+  }
+}
+
 function setStatus(text, state = "idle") {
   statusEl.textContent = text;
   statusEl.dataset.state = state;
@@ -96,6 +178,150 @@ function setClipboardText(text, updatedAt) {
   lastUpdatedAt = updatedAt;
   textEl.value = text;
   updatedAtEl.textContent = updatedAt ? `Last synced ${new Date(updatedAt).toLocaleTimeString()}` : "";
+}
+
+function applyFileConfig(config) {
+  if (!config || typeof config !== "object") {
+    return;
+  }
+
+  if (typeof config.pathPrefix === "string" && config.pathPrefix) {
+    filePathPrefix = normalizePathPrefix(config.pathPrefix, DEFAULT_FILE_PATH_PREFIX);
+  }
+
+  if (typeof config.listEndpoint === "string" && config.listEndpoint) {
+    fileListEndpointPath = normalizeEndpointPath(config.listEndpoint, DEFAULT_FILE_LIST_ENDPOINT);
+  }
+
+  if (config.upload?.endpoint) {
+    uploadEndpointPath = normalizeEndpointPath(config.upload.endpoint, DEFAULT_FILE_UPLOAD_ENDPOINT);
+  }
+}
+
+function getIncomingFileConfig(message) {
+  if (!message || typeof message !== "object") {
+    return null;
+  }
+
+  return message.fileConfig || message.config || message.files || null;
+}
+
+function formatFileSize(size) {
+  const value = Number(size) || 0;
+
+  if (value < 1024) {
+    return `${value} B`;
+  }
+
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+
+  if (value < 1024 * 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function normalizeFileRecord(file) {
+  if (!file || typeof file.name !== "string") {
+    return null;
+  }
+
+  const url = typeof file.url === "string"
+    ? file.url
+    : `${filePathPrefix}${encodeURIComponent(file.name)}`;
+
+  return {
+    name: file.name,
+    size: Number(file.size) || 0,
+    type: file.type || "application/octet-stream",
+    uploadTime: file.uploadTime || null,
+    url
+  };
+}
+
+function sortFiles(files) {
+  return [...files].sort((left, right) => {
+    const leftTime = left.uploadTime ? new Date(left.uploadTime).getTime() : 0;
+    const rightTime = right.uploadTime ? new Date(right.uploadTime).getTime() : 0;
+    return rightTime - leftTime;
+  });
+}
+
+function mergeFileRecord(file) {
+  const normalized = normalizeFileRecord(file);
+
+  if (!normalized) {
+    return;
+  }
+
+  const nextFiles = latestFiles.filter((entry) => entry.name !== normalized.name);
+  nextFiles.push(normalized);
+  latestFiles = sortFiles(nextFiles);
+  renderFileList();
+}
+
+function findFileRecord(fileName) {
+  return latestFiles.find((file) => file.name === fileName) || null;
+}
+
+function setFileList(files) {
+  latestFiles = sortFiles(
+    (Array.isArray(files) ? files : [])
+      .map(normalizeFileRecord)
+      .filter(Boolean)
+  );
+  renderFileList();
+}
+
+function renderFileList() {
+  fileListEl.textContent = "";
+
+  if (latestFiles.length === 0) {
+    const emptyItem = document.createElement("li");
+    emptyItem.className = "file-item";
+    emptyItem.innerHTML = '<div class="file-info"><span class="file-name">No shared files yet</span></div>';
+    fileListEl.appendChild(emptyItem);
+    return;
+  }
+
+  for (const file of latestFiles) {
+    const item = document.createElement("li");
+    item.className = "file-item";
+
+    const info = document.createElement("div");
+    info.className = "file-info";
+
+    const name = document.createElement("span");
+    name.className = "file-name";
+    name.textContent = file.name;
+    name.title = file.name;
+
+    const size = document.createElement("span");
+    size.className = "file-size";
+    size.textContent = formatFileSize(file.size);
+
+    info.appendChild(name);
+    info.appendChild(size);
+
+    const actions = document.createElement("div");
+    actions.className = "file-actions";
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary";
+    button.textContent = "Download";
+    button.addEventListener("click", () => {
+      requestFileDownload(file.name);
+    });
+
+    actions.appendChild(button);
+    item.appendChild(info);
+    item.appendChild(actions);
+    fileListEl.appendChild(item);
+  }
 }
 
 function closeSocket() {
@@ -161,6 +387,192 @@ function updateInputState() {
   serverHostEl.dataset.state = state;
 }
 
+async function requestAvailableFiles() {
+  const listUrl = buildServerHttpUrl(fileListEndpointPath);
+
+  if (listUrl) {
+    try {
+      const response = await window.fetch(listUrl, { cache: "no-store" });
+      const payload = await response.json().catch(() => null);
+
+      if (response.ok && Array.isArray(payload)) {
+        setFileList(payload);
+        return;
+      }
+    } catch (error) {
+      console.warn("HTTP file list refresh failed, falling back to WebSocket:", error);
+    }
+  }
+
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "fileList" }));
+  }
+}
+
+function scheduleFileListRefresh() {
+  if (fileListRefreshTimer) {
+    return;
+  }
+
+  fileListRefreshTimer = window.setTimeout(() => {
+    fileListRefreshTimer = null;
+    requestAvailableFiles();
+  }, FILE_LIST_REFRESH_DEBOUNCE_MS);
+}
+
+function requestUploadTarget() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("Connect to a LAN clipboard server before uploading files."));
+  }
+
+  if (pendingUploadRequest) {
+    return pendingUploadRequest.promise;
+  }
+
+  let settled = false;
+  let timeoutId = null;
+  let resolvePromise;
+  let rejectPromise;
+
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+
+  const finalize = (callback, value) => {
+    if (settled) {
+      return;
+    }
+
+    settled = true;
+
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+    }
+
+    pendingUploadRequest = null;
+    callback(value);
+  };
+
+  pendingUploadRequest = {
+    promise,
+    resolve(payload) {
+      finalize(resolvePromise, payload);
+    },
+    reject(error) {
+      finalize(rejectPromise, error);
+    }
+  };
+
+  timeoutId = window.setTimeout(() => {
+    pendingUploadRequest?.reject(new Error("The server did not respond with an upload endpoint."));
+  }, CONNECT_TIMEOUT_MS);
+
+  socket.send(JSON.stringify({ type: "fileUpload" }));
+  return promise;
+}
+
+async function startDownloadFromUrl(downloadPath, fileName) {
+  const downloadUrl = /^https?:\/\//i.test(downloadPath)
+    ? downloadPath
+    : buildServerHttpUrl(downloadPath);
+
+  if (!downloadUrl) {
+    setStatus("No reachable file download endpoint is available yet.", "error");
+    return;
+  }
+
+  try {
+    const link = document.createElement("a");
+    link.href = downloadUrl;
+    link.download = fileName || "download";
+    link.rel = "noopener";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    setStatus(`Downloading ${fileName}…`, "connected");
+  } catch (error) {
+    console.error("Download failed:", error);
+    setStatus(`Failed to download ${fileName}.`, "error");
+  }
+}
+
+function requestFileDownload(fileName) {
+  const existingFile = findFileRecord(fileName);
+
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (existingFile?.url) {
+      startDownloadFromUrl(existingFile.url, existingFile.name);
+      return;
+    }
+
+    setStatus("Connect to a LAN clipboard server before downloading files.", "error");
+    return;
+  }
+
+  socket.send(JSON.stringify({ type: "fileDownload", name: fileName }));
+}
+
+async function uploadFiles(fileList) {
+  const files = [...(fileList || [])].filter((file) => file instanceof File);
+
+  if (files.length === 0) {
+    return;
+  }
+
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    setStatus("Connect to a LAN clipboard server before uploading files.", "error");
+    return;
+  }
+
+  isUploading = true;
+  dropZoneEl.classList.add("dragover");
+
+  try {
+    const uploadTarget = await requestUploadTarget();
+    const endpointPath = uploadTarget?.endpoint || uploadEndpointPath;
+    const fieldName = uploadTarget?.fieldName || "file";
+    const uploadUrl = buildServerHttpUrl(endpointPath);
+
+    if (!uploadUrl) {
+      throw new Error("The file upload endpoint is not available yet.");
+    }
+
+    for (const file of files) {
+      const formData = new FormData();
+      formData.append(fieldName, file, file.name);
+
+      setStatus(`Uploading ${file.name}…`, "connecting");
+
+      const response = await window.fetch(uploadUrl, {
+        method: uploadTarget?.method || "POST",
+        body: formData
+      });
+
+      const payload = await response.json().catch(() => null);
+
+      if (!response.ok || !payload?.ok || !payload.file) {
+        const message = payload?.message || `Upload failed with status ${response.status}`;
+        throw new Error(message);
+      }
+
+      applyFileConfig(payload.config);
+      mergeFileRecord(payload.file.url ? payload.file : { ...payload.file, url: payload.url });
+      setStatus(`Uploaded ${payload.file.name}.`, "connected");
+    }
+
+    requestAvailableFiles();
+  } catch (error) {
+    console.error("Upload failed:", error);
+    setStatus(error.message || "Failed to upload file.", "error");
+  } finally {
+    isUploading = false;
+    dropZoneEl.classList.remove("dragover");
+    fileInputEl.value = "";
+  }
+}
+
 async function connect({ mode = "auto", preferredHost = getPreferredManualValue(), force = false } = {}) {
   if (isConnecting) {
     queuedConnectOptions = { mode, preferredHost, force };
@@ -210,6 +622,7 @@ async function connect({ mode = "auto", preferredHost = getPreferredManualValue(
 
   if (socket && !force && socket.readyState === WebSocket.OPEN && candidates.includes(currentServerUrl)) {
     setStatus(`Connected to ${getConnectionLabel(currentServerUrl)}`, "connected");
+    requestAvailableFiles();
     return;
   }
 
@@ -276,6 +689,7 @@ function attemptConnection({ candidates, index, mode, runId }) {
     didOpen = true;
     currentServerUrl = serverUrl;
     setStatus(`Connected to ${label}. Syncing latest clipboard…`, "connected");
+    requestAvailableFiles();
   };
 
   localSocket.onmessage = (event) => {
@@ -284,6 +698,7 @@ function attemptConnection({ candidates, index, mode, runId }) {
     }
 
     let message;
+
     try {
       message = JSON.parse(event.data);
     } catch (error) {
@@ -291,14 +706,65 @@ function attemptConnection({ candidates, index, mode, runId }) {
     }
 
     if (message.type === "init" || message.type === "clipboard" || message.type === "ack") {
+      applyFileConfig(getIncomingFileConfig(message));
       initialSyncReceived = true;
       setClipboardText(message.text || "", message.updatedAt);
       setStatus(`Connected to ${label}`, "connected");
       return;
     }
 
-    if (message.type === "error") {
-      setStatus(`Server error: ${message.message}`, "error");
+    switch (message.type) {
+      case "fileList":
+        applyFileConfig(getIncomingFileConfig(message));
+        setFileList(message.files);
+        return;
+      case "fileUpload":
+        applyFileConfig(getIncomingFileConfig(message) || { upload: message.upload });
+
+        if (message.ok === false) {
+          if (pendingUploadRequest) {
+            pendingUploadRequest.reject(new Error(message.message || "Upload negotiation failed."));
+          }
+
+          setStatus(message.message || "Upload negotiation failed.", "error");
+          return;
+        }
+
+        if (message.ok && message.upload && pendingUploadRequest) {
+          pendingUploadRequest.resolve(message.upload);
+        }
+
+        if (message.file) {
+          mergeFileRecord(message.file.url ? message.file : { ...message.file, url: message.url });
+          scheduleFileListRefresh();
+        }
+        return;
+      case "fileDownload":
+        applyFileConfig(getIncomingFileConfig(message));
+
+        if (message.ok === false) {
+          setStatus(message.message || "Download request failed.", "error");
+          return;
+        }
+
+        const downloadUrl = message.file?.url || message.url;
+
+        if (!downloadUrl) {
+          setStatus("The server did not provide a file download URL.", "error");
+          return;
+        }
+
+        startDownloadFromUrl(downloadUrl, message.file?.name || "download");
+        return;
+      case "error":
+        if (pendingUploadRequest) {
+          pendingUploadRequest.reject(new Error(message.message || "Upload negotiation failed."));
+        }
+
+        setStatus(`Server error: ${message.message}`, "error");
+        return;
+      default:
+        return;
     }
   };
 
@@ -321,6 +787,9 @@ function attemptConnection({ candidates, index, mode, runId }) {
     }
 
     socket = null;
+    if (pendingUploadRequest) {
+      pendingUploadRequest.reject(new Error("The server disconnected before the upload could start."));
+    }
 
     if (!shouldReconnect) {
       return;
@@ -334,9 +803,9 @@ function attemptConnection({ candidates, index, mode, runId }) {
     currentServerUrl = "";
 
     if (didOpen && !initialSyncReceived) {
-      setStatus(`Connected, but initial sync was interrupted. Reconnecting…`, "connecting");
+      setStatus("Connected, but initial sync was interrupted. Reconnecting…", "connecting");
     } else {
-      setStatus(`Disconnected. Reconnecting in the background…`, "connecting");
+      setStatus("Disconnected. Reconnecting in the background…", "connecting");
     }
 
     queueReconnect();
@@ -369,7 +838,11 @@ function scheduleManualConnect() {
       return;
     }
 
-    if (latestValue === lastRequestedManualHost && currentServerUrl === normalizedHost && socket?.readyState === WebSocket.OPEN) {
+    if (
+      latestValue === lastRequestedManualHost &&
+      currentServerUrl === normalizedHost &&
+      socket?.readyState === WebSocket.OPEN
+    ) {
       setStatus(`Connected to ${getConnectionLabel(normalizedHost)}`, "connected");
       return;
     }
@@ -389,6 +862,51 @@ function resetToAutomaticDiscovery() {
   connect({ mode: "auto", force: true });
 }
 
+function preventDragDefaults(event) {
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+for (const eventName of ["dragenter", "dragover", "dragleave", "drop"]) {
+  dropZoneEl.addEventListener(eventName, preventDragDefaults);
+}
+
+for (const eventName of ["dragenter", "dragover"]) {
+  dropZoneEl.addEventListener(eventName, () => {
+    if (!isUploading) {
+      dropZoneEl.classList.add("dragover");
+    }
+  });
+}
+
+for (const eventName of ["dragleave", "drop"]) {
+  dropZoneEl.addEventListener(eventName, () => {
+    if (!isUploading) {
+      dropZoneEl.classList.remove("dragover");
+    }
+  });
+}
+
+dropZoneEl.addEventListener("drop", (event) => {
+  uploadFiles(event.dataTransfer?.files || []);
+});
+
+dropZoneEl.addEventListener("click", (event) => {
+  if (event.target === fileInputButtonEl) {
+    return;
+  }
+
+  fileInputEl.click();
+});
+
+fileInputButtonEl.addEventListener("click", () => {
+  fileInputEl.click();
+});
+
+fileInputEl.addEventListener("change", () => {
+  uploadFiles(fileInputEl.files || []);
+});
+
 document.getElementById("pushButton").addEventListener("click", () => {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     setStatus("Not connected to a LAN clipboard server.", "error");
@@ -402,12 +920,14 @@ document.getElementById("pushButton").addEventListener("click", () => {
 document.getElementById("copyButton").addEventListener("click", async () => {
   try {
     const text = textEl.value;
+
     if (!text) return;
+
     await navigator.clipboard.writeText(text);
     setStatus("Copied to your local clipboard.", "connected");
   } catch (err) {
     console.error("Failed to copy: ", err);
-    // Fallback for environments where navigator.clipboard might be restricted
+
     try {
       const textArea = document.createElement("textarea");
       textArea.value = textEl.value;
@@ -435,6 +955,7 @@ serverHostEl.addEventListener("keydown", (event) => {
 serverHostEl.value = getInitialServerHost();
 lastRequestedManualHost = serverHostEl.value.trim();
 updateInputState();
+renderFileList();
 connect({
   mode: serverHostEl.value.trim() ? "manual" : "auto",
   preferredHost: serverHostEl.value.trim()

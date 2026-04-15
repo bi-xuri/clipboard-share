@@ -12,14 +12,26 @@ const MDNS_SERVICE_TYPE = `_${MDNS_BONJOUR_TYPE}._tcp.local`;
 const MDNS_DEFAULT_HOSTNAME = "clipboard-share.local";
 const DISCOVERY_MAGIC = "lan-clipboard-discovery";
 const WEB_ROOT = path.resolve(__dirname, "../web");
-const UPLOADS_DIR = path.resolve(__dirname, "uploads");
+const SHARED_FILES_DIR = path.resolve(__dirname, "../shared_files");
 const MAX_FILE_SIZE = 100 * 1024 * 1024;
 const MAX_MULTIPART_BODY_SIZE = MAX_FILE_SIZE + 1024 * 1024;
 const MAX_FILENAME_LENGTH = 255;
 const HEADER_SEPARATOR = Buffer.from("\r\n\r\n");
 const FILE_PATH_PREFIX = "/files/";
+const FILE_UPLOAD_DESCRIPTOR = {
+  endpoint: "/upload",
+  method: "POST",
+  fieldName: "file",
+  contentType: "multipart/form-data",
+  maxFileSize: MAX_FILE_SIZE
+};
+const FILE_ROUTE_DESCRIPTOR = {
+  listEndpoint: "/files",
+  pathPrefix: FILE_PATH_PREFIX,
+  upload: FILE_UPLOAD_DESCRIPTOR
+};
 
-ensureDirectory(UPLOADS_DIR);
+ensureDirectory(SHARED_FILES_DIR);
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
@@ -39,6 +51,10 @@ function ensureDirectory(directoryPath) {
   if (!fs.existsSync(directoryPath)) {
     fs.mkdirSync(directoryPath, { recursive: true });
   }
+}
+
+function ensureSharedFilesDirectory() {
+  ensureDirectory(SHARED_FILES_DIR);
 }
 
 function createHttpError(statusCode, message) {
@@ -228,6 +244,86 @@ function buildStoredFileMetadata(fileName, stats, contentType) {
   };
 }
 
+function buildDownloadUrl(fileName) {
+  return `${FILE_PATH_PREFIX}${encodeURIComponent(fileName)}`;
+}
+
+function serializeSharedFileMetadata(file) {
+  return {
+    ...file,
+    url: buildDownloadUrl(file.name)
+  };
+}
+
+function getFileRouteDescriptor() {
+  return {
+    listEndpoint: FILE_ROUTE_DESCRIPTOR.listEndpoint,
+    pathPrefix: FILE_ROUTE_DESCRIPTOR.pathPrefix,
+    upload: { ...FILE_ROUTE_DESCRIPTOR.upload }
+  };
+}
+
+function buildFileListMessage(files) {
+  return {
+    type: "fileList",
+    files: files.map(serializeSharedFileMetadata),
+    config: getFileRouteDescriptor()
+  };
+}
+
+function buildFileUploadBroadcastMessage(file) {
+  const serializedFile = serializeSharedFileMetadata(file);
+
+  return {
+    type: "fileUpload",
+    file: serializedFile,
+    url: serializedFile.url,
+    config: getFileRouteDescriptor()
+  };
+}
+
+function buildFileUploadDescriptorMessage() {
+  return {
+    type: "fileUpload",
+    ok: true,
+    upload: { ...FILE_UPLOAD_DESCRIPTOR },
+    config: getFileRouteDescriptor()
+  };
+}
+
+function buildFileDownloadMessage(file) {
+  const serializedFile = serializeSharedFileMetadata(file);
+
+  return {
+    ok: true,
+    type: "fileDownload",
+    file: serializedFile,
+    url: serializedFile.url,
+    config: getFileRouteDescriptor()
+  };
+}
+
+function buildFileOperationErrorMessage(type, message) {
+  return {
+    type,
+    ok: false,
+    message,
+    config: getFileRouteDescriptor()
+  };
+}
+
+function buildInitMessage({ text, updatedAt }) {
+  const config = getFileRouteDescriptor();
+
+  return {
+    type: "init",
+    text,
+    updatedAt,
+    files: config,
+    fileConfig: config
+  };
+}
+
 function getRequestedFileName(rawName) {
   let decodedName;
 
@@ -324,6 +420,13 @@ function buildDiscoveryPayload({ req, httpPort, discoveryPort, mdnsHostname, lat
 function sendJsonResponse(res, statusCode, payload) {
   res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(payload));
+}
+
+function setCorsHeaders(req, res) {
+  const origin = req.headers.origin || "*";
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Expose-Headers", "Content-Disposition, Content-Length, Content-Type");
+  res.setHeader("Vary", "Origin");
 }
 
 function sendStaticFile(res, requestPath) {
@@ -473,10 +576,10 @@ function createApp(options = {}) {
   const fileMetadata = new Map();
 
   function syncStoredFiles() {
-    ensureDirectory(UPLOADS_DIR);
+    ensureSharedFilesDirectory();
 
     const seenFileNames = new Set();
-    const entries = fs.readdirSync(UPLOADS_DIR, { withFileTypes: true });
+    const entries = fs.readdirSync(SHARED_FILES_DIR, { withFileTypes: true });
 
     for (const entry of entries) {
       if (!entry.isFile()) {
@@ -484,7 +587,7 @@ function createApp(options = {}) {
       }
 
       const fileName = entry.name;
-      const filePath = path.resolve(UPLOADS_DIR, fileName);
+      const filePath = path.resolve(SHARED_FILES_DIR, fileName);
       const stats = fs.statSync(filePath);
       const existing = fileMetadata.get(fileName);
 
@@ -508,22 +611,25 @@ function createApp(options = {}) {
   }
 
   function resolveStoredFilePath(fileName) {
-    const resolvedPath = path.resolve(UPLOADS_DIR, fileName);
+    ensureSharedFilesDirectory();
 
-    if (!resolvedPath.startsWith(`${UPLOADS_DIR}${path.sep}`)) {
+    const resolvedPath = path.resolve(SHARED_FILES_DIR, fileName);
+
+    if (!resolvedPath.startsWith(`${SHARED_FILES_DIR}${path.sep}`)) {
       throw createHttpError(400, "Invalid file name");
     }
 
     return resolvedPath;
   }
 
-  function getDownloadUrl(fileName) {
-    return `${FILE_PATH_PREFIX}${encodeURIComponent(fileName)}`;
-  }
-
   function findFileMetadata(fileName) {
     syncStoredFiles();
     return fileMetadata.get(fileName) || null;
+  }
+
+  function broadcastSharedFileUpdate(file) {
+    broadcast(buildFileUploadBroadcastMessage(file));
+    broadcast(buildFileListMessage(listAvailableFiles()));
   }
 
   function createUniqueFileName(originalName) {
@@ -541,6 +647,9 @@ function createApp(options = {}) {
   }
 
   async function handleFileUpload(req, res) {
+    setCorsHeaders(req, res);
+    ensureSharedFilesDirectory();
+
     const contentType = req.headers["content-type"];
     const boundary = parseMultipartBoundary(contentType);
     const contentLength = getContentLength(req);
@@ -583,24 +692,24 @@ function createApp(options = {}) {
     const metadata = buildStoredFileMetadata(storedName, stats, file.contentType);
     fileMetadata.set(storedName, metadata);
 
-    broadcast({
-      type: "fileUpload",
-      file: metadata,
-      url: getDownloadUrl(metadata.name)
-    });
+    broadcastSharedFileUpdate(metadata);
 
     sendJsonResponse(res, 201, {
       ok: true,
-      file: metadata,
-      url: getDownloadUrl(metadata.name)
+      file: serializeSharedFileMetadata(metadata),
+      url: buildDownloadUrl(metadata.name),
+      config: getFileRouteDescriptor()
     });
   }
 
-  function handleFileList(res) {
-    sendJsonResponse(res, 200, listAvailableFiles());
+  function handleFileList(req, res) {
+    setCorsHeaders(req, res);
+    sendJsonResponse(res, 200, listAvailableFiles().map(serializeSharedFileMetadata));
   }
 
-  function handleFileDownload(res, rawName) {
+  function handleFileDownload(req, res, rawName) {
+    setCorsHeaders(req, res);
+
     const requestedName = getRequestedFileName(rawName);
 
     if (!requestedName) {
@@ -664,7 +773,7 @@ function createApp(options = {}) {
     }
 
     if (req.method === "GET" && parsedUrl.pathname === "/files") {
-      handleFileList(res);
+      handleFileList(req, res);
       return;
     }
 
@@ -672,7 +781,7 @@ function createApp(options = {}) {
       const rawName = parsedUrl.pathname.slice(FILE_PATH_PREFIX.length);
 
       if (rawName) {
-        handleFileDownload(res, rawName);
+        handleFileDownload(req, res, rawName);
         return;
       }
     }
@@ -686,8 +795,11 @@ function createApp(options = {}) {
       )
     ) {
       res.writeHead(204, {
+        "Access-Control-Allow-Origin": req.headers.origin || "*",
         "Access-Control-Allow-Methods": parsedUrl.pathname === "/upload" ? "POST, OPTIONS" : "GET, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Content-Type",
+        "Vary": "Origin",
         "Content-Length": "0"
       });
       res.end();
@@ -778,60 +890,37 @@ function createApp(options = {}) {
   }
 
   function sendAvailableFiles(socket) {
-    sendJson(socket, {
-      type: "fileList",
-      files: listAvailableFiles().map((file) => ({
-        ...file,
-        url: getDownloadUrl(file.name)
-      }))
-    });
+    sendJson(socket, buildFileListMessage(listAvailableFiles()));
   }
 
   function sendFileDownload(socket, fileName) {
     if (typeof fileName !== "string") {
-      sendJson(socket, {
-        type: "error",
-        message: "Invalid file name"
-      });
+      sendJson(socket, buildFileOperationErrorMessage("fileDownload", "Invalid file name"));
       return;
     }
 
     const requestedName = getRequestedFileName(fileName);
 
     if (!requestedName) {
-      sendJson(socket, {
-        type: "error",
-        message: "Invalid file name"
-      });
+      sendJson(socket, buildFileOperationErrorMessage("fileDownload", "Invalid file name"));
       return;
     }
 
     const metadata = findFileMetadata(requestedName);
 
     if (!metadata) {
-      sendJson(socket, {
-        type: "error",
-        message: "File not found"
-      });
+      sendJson(socket, buildFileOperationErrorMessage("fileDownload", "File not found"));
       return;
     }
 
-    sendJson(socket, {
-      type: "fileDownload",
-      file: metadata,
-      url: getDownloadUrl(metadata.name)
-    });
+    sendJson(socket, buildFileDownloadMessage(metadata));
   }
 
   wss.on("connection", (socket, req) => {
     socket.clientId = nextClientId;
     nextClientId += 1;
 
-    sendJson(socket, {
-      type: "init",
-      text: latestText,
-      updatedAt
-    });
+    sendJson(socket, buildInitMessage({ text: latestText, updatedAt }));
 
     socket.on("message", (raw) => {
       let message;
@@ -872,16 +961,7 @@ function createApp(options = {}) {
       }
 
       if (message.type === "fileUpload") {
-        sendJson(socket, {
-          type: "fileUpload",
-          ok: true,
-          upload: {
-            endpoint: "/upload",
-            method: "POST",
-            contentType: "multipart/form-data",
-            maxFileSize: MAX_FILE_SIZE
-          }
-        });
+        sendJson(socket, buildFileUploadDescriptorMessage());
         return;
       }
 
@@ -899,14 +979,30 @@ function createApp(options = {}) {
   });
 
   async function start() {
+    ensureSharedFilesDirectory();
     syncStoredFiles();
 
-    await new Promise((resolve) => {
-      server.listen(configuredPort, host, () => {
+    await new Promise((resolve, reject) => {
+      const handleError = (error) => {
+        server.off("listening", handleListening);
+        reject(error);
+      };
+
+      const handleListening = () => {
+        server.off("error", handleError);
         const address = server.address();
         resolvedHttpPort = typeof address === "object" ? address.port : configuredPort;
         resolve();
-      });
+      };
+
+      server.once("error", handleError);
+
+      try {
+        server.listen(configuredPort, host, handleListening);
+      } catch (error) {
+        server.off("error", handleError);
+        reject(error);
+      }
     });
 
     if (enableUdpDiscovery) {
@@ -1003,11 +1099,23 @@ if (require.main === module) {
 }
 
 module.exports = {
+  FILE_PATH_PREFIX,
+  FILE_ROUTE_DESCRIPTOR,
+  FILE_UPLOAD_DESCRIPTOR,
   MDNS_DEFAULT_HOSTNAME,
   MDNS_SERVICE_NAME,
   MDNS_SERVICE_TYPE,
+  SHARED_FILES_DIR,
+  buildDownloadUrl,
   buildDiscoveryPayload,
+  buildFileDownloadMessage,
+  buildFileListMessage,
+  buildFileUploadBroadcastMessage,
+  buildFileUploadDescriptorMessage,
+  buildInitMessage,
   createApp,
+  getFileRouteDescriptor,
   sendStaticFile,
+  serializeSharedFileMetadata,
   sanitizeMdnsHostname
 };
