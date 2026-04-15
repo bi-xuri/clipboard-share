@@ -8,6 +8,7 @@ body {
 .popup {
   width: 360px;
   padding: 16px;
+  box-sizing: border-box;
 }
 
 h1 {
@@ -23,15 +24,64 @@ label,
   font-size: 13px;
 }
 
+.server-config {
+  margin-bottom: 8px;
+}
+
+.server-config-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+input,
 textarea {
   width: 100%;
-  resize: vertical;
   box-sizing: border-box;
   padding: 10px;
   border: 1px solid #c9d2de;
   border-radius: 8px;
   background: #ffffff;
   color: #1c2430;
+}
+
+textarea {
+  resize: vertical;
+}
+
+.tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.tab-button {
+  border: 1px solid #c9d2de;
+  border-radius: 999px;
+  padding: 9px 12px;
+  background: #ffffff;
+  color: #405063;
+  font-weight: 600;
+}
+
+.tab-button:hover {
+  background: #eef3ff;
+}
+
+.tab-button.is-active {
+  border-color: #1f5eff;
+  background: #1f5eff;
+  color: #ffffff;
+}
+
+.panel {
+  display: none;
+}
+
+.panel.is-active {
+  display: block;
 }
 
 .buttons {
@@ -53,6 +103,77 @@ button {
 
 button:hover {
   background: #1747c2;
+}
+
+.secondary-button {
+  padding: 8px 12px;
+  background: #e8eefb;
+  color: #1c2430;
+}
+
+.secondary-button:hover {
+  background: #dbe6fb;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.section-title {
+  margin-bottom: 0;
+}
+
+.file-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.file-item,
+.file-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #d8dfeb;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.file-info {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.file-name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-meta {
+  font-size: 12px;
+  color: #5c6978;
+}
+
+.file-download {
+  flex-shrink: 0;
+  padding: 8px 12px;
+}
+
+.status.error {
+  color: #b3261e;
 }
 
 .updated-at {

@@ -1,59 +1,62 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>LAN Clipboard Web</title>
-    <link rel="stylesheet" href="styles.css">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clipboard Share</title>
+    <link rel="stylesheet" href="/styles.css">
   </head>
-  <body class="mobile-optimized">
-    <main class="app">
-      <section class="card">
-        <div class="hero">
-          <div>
-            <p class="eyebrow">LAN clipboard</p>
-            <h1>Shared Clipboard</h1>
-            <p class="subhead">Instant clipboard sync across your local network, with automatic fallback when one route fails.</p>
-          </div>
-          <p id="connectionStatus" class="status-pill" data-state="connecting">Initializing…</p>
-        </div>
+  <body>
+    <div class="app">
+      <header>
+        <h1 class="title">Clipboard Share</h1>
+        <p id="connectionStatus" data-state="idle">Initializing...</p>
+      </header>
 
-        <div class="server-config">
-          <label for="serverHost">Preferred Server</label>
+      <main>
+        <section class="card clipboard-panel">
+          <div class="panel-head">
+            <h2>Shared Clipboard</h2>
+            <span id="updatedAt"></span>
+          </div>
+
           <div class="input-shell">
-            <span class="input-prefix">LAN</span>
-            <input id="serverHost" type="text" spellcheck="false" autocomplete="off" placeholder="Type a hostname, IP, or ws:// URL">
-            <button id="saveServerButton" type="button" class="secondary">Auto</button>
+            <textarea id="clipboardText" placeholder="Type something to share..."></textarea>
+            <div class="actions">
+              <button id="pushButton" type="button">Share to LAN</button>
+              <button id="copyButton" type="button" class="secondary">Copy Local</button>
+            </div>
           </div>
-          <p class="hint">Type any valid host and the app connects immediately. Leave it blank to stay on zero-touch discovery.</p>
-        </div>
-
-        <div class="clipboard-panel">
-          <div class="panel-head">
-            <label for="clipboardText">Current text</label>
-            <p id="updatedAt" class="timestamp"></p>
-          </div>
-          <textarea id="clipboardText" rows="10" placeholder="Shared clipboard text"></textarea>
-        </div>
-
-        <section class="file-panel card" style="margin-top: 24px; width: 100%; box-sizing: border-box;">
-          <div class="panel-head">
-            <h1 style="font-size: clamp(24px, 4vw, 32px);">Shared Files</h1>
-          </div>
-          <div id="dropZone" class="drop-zone">
-            <p>Drag & drop files here or <button id="fileInputBtn" type="button" class="secondary">click to upload</button></p>
-            <input id="fileInput" type="file" multiple style="display:none">
-          </div>
-          <ul id="fileList" class="file-list"></ul>
         </section>
 
-        <div class="actions">
-          <button id="pushButton" type="button" class="primary">Share to LAN</button>
-          <button id="copyButton" type="button" class="secondary">Copy Local</button>
+        <section class="card file-panel">
+          <div class="panel-head">
+            <h2>Shared Files</h2>
+          </div>
+
+          <div id="dropZone" class="drop-zone">
+            <p>Drag &amp; drop files here or</p>
+            <button id="fileInputBtn" type="button" class="secondary">Select Files</button>
+            <input type="file" id="fileInput" multiple hidden>
+          </div>
+
+          <ul id="fileList" class="file-list"></ul>
+        </section>
+      </main>
+
+      <footer>
+        <div class="server-config">
+          <label for="serverHost">Server Host (IP or URL):</label>
+          <div class="input-shell">
+            <input type="text" id="serverHost" placeholder="e.g., 192.168.1.50:8080">
+            <button id="saveServerButton" type="button" class="secondary">Auto Discovery</button>
+          </div>
+          <p id="serverHostStatus"></p>
         </div>
-      </section>
-    </main>
-    <script src="discovery.js"></script>
-    <script src="app.js"></script>
+      </footer>
+    </div>
+
+    <script src="/discovery.js"></script>
+    <script src="/app.js"></script>
   </body>
 </html>

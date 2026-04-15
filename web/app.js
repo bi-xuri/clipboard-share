@@ -42,6 +42,9 @@ let fileListEndpointPath = DEFAULT_FILE_LIST_ENDPOINT;
 let filePathPrefix = DEFAULT_FILE_PATH_PREFIX;
 let pendingUploadRequest = null;
 let fileListRefreshTimer = null;
+let dropZoneDragDepth = 0;
+let dropZoneBaseText = "";
+let pendingUploads = [];
 
 let lastRequestedManualHost = "";
 let clipboardText = "";
@@ -173,6 +176,61 @@ function setStatus(text, state = "idle") {
   statusEl.dataset.state = state;
 }
 
+function getDropZoneMessageEl() {
+  return dropZoneEl.querySelector("p");
+}
+
+function setDropZoneMessage(text) {
+  const messageEl = getDropZoneMessageEl();
+
+  if (messageEl) {
+    messageEl.textContent = text;
+  }
+}
+
+function setDropZoneUploading(isActive, label = "") {
+  dropZoneEl.classList.toggle("uploading", Boolean(isActive));
+  dropZoneEl.setAttribute("aria-busy", isActive ? "true" : "false");
+
+  if (isActive) {
+    setDropZoneMessage(label ? `Uploading ${label}...` : "Uploading files...");
+    return;
+  }
+
+  setDropZoneMessage(dropZoneBaseText || "Drag & drop files here or");
+}
+
+function setDropZoneActive(isActive) {
+  dropZoneEl.classList.toggle("dragover", Boolean(isActive));
+}
+
+function resetDropZoneState() {
+  dropZoneDragDepth = 0;
+
+  if (!isUploading) {
+    setDropZoneActive(false);
+  }
+}
+
+function eventIncludesFiles(event) {
+  const dataTransfer = event?.dataTransfer;
+  const types = dataTransfer?.types;
+
+  if (dataTransfer?.files?.length) {
+    return true;
+  }
+
+  if (dataTransfer?.items?.length) {
+    return Array.from(dataTransfer.items).some((item) => item.kind === "file");
+  }
+
+  if (!types) {
+    return false;
+  }
+
+  return Array.from(types).includes("Files");
+}
+
 function setClipboardText(text, updatedAt) {
   clipboardText = text;
   lastUpdatedAt = updatedAt;
@@ -242,6 +300,21 @@ function normalizeFileRecord(file) {
   };
 }
 
+function createPendingUploadRecord(file) {
+  if (!(file instanceof File)) {
+    return null;
+  }
+
+  return {
+    id: `${file.name}:${file.size}:${file.lastModified}`,
+    name: file.name || "Unnamed file",
+    size: Number(file.size) || 0,
+    type: file.type || "application/octet-stream",
+    uploadTime: null,
+    isPending: true
+  };
+}
+
 function sortFiles(files) {
   return [...files].sort((left, right) => {
     const leftTime = left.uploadTime ? new Date(left.uploadTime).getTime() : 0;
@@ -276,20 +349,65 @@ function setFileList(files) {
   renderFileList();
 }
 
+function addPendingUploads(files) {
+  const nextPending = files
+    .map(createPendingUploadRecord)
+    .filter(Boolean);
+
+  if (nextPending.length === 0) {
+    return [];
+  }
+
+  pendingUploads = [
+    ...pendingUploads.filter(
+      (existing) => !nextPending.some((candidate) => candidate.id === existing.id)
+    ),
+    ...nextPending
+  ];
+  renderFileList();
+  return nextPending;
+}
+
+function removePendingUpload(recordId) {
+  const nextPending = pendingUploads.filter((entry) => entry.id !== recordId);
+
+  if (nextPending.length === pendingUploads.length) {
+    return;
+  }
+
+  pendingUploads = nextPending;
+  renderFileList();
+}
+
 function renderFileList() {
   fileListEl.textContent = "";
+  const visibleFiles = [...pendingUploads, ...latestFiles];
 
-  if (latestFiles.length === 0) {
+  if (visibleFiles.length === 0) {
     const emptyItem = document.createElement("li");
-    emptyItem.className = "file-item";
-    emptyItem.innerHTML = '<div class="file-info"><span class="file-name">No shared files yet</span></div>';
+    emptyItem.className = "file-item file-item-empty";
+
+    const info = document.createElement("div");
+    info.className = "file-info";
+
+    const name = document.createElement("span");
+    name.className = "file-name";
+    name.textContent = "No shared files yet";
+
+    const hint = document.createElement("span");
+    hint.className = "file-size";
+    hint.textContent = "Drop a file above or use Select Files.";
+
+    info.appendChild(name);
+    info.appendChild(hint);
+    emptyItem.appendChild(info);
     fileListEl.appendChild(emptyItem);
     return;
   }
 
-  for (const file of latestFiles) {
+  for (const file of visibleFiles) {
     const item = document.createElement("li");
-    item.className = "file-item";
+    item.className = file.isPending ? "file-item file-item-pending" : "file-item";
 
     const info = document.createElement("div");
     info.className = "file-info";
@@ -301,25 +419,30 @@ function renderFileList() {
 
     const size = document.createElement("span");
     size.className = "file-size";
-    size.textContent = formatFileSize(file.size);
+    size.textContent = file.isPending
+      ? `${formatFileSize(file.size)} • Uploading…`
+      : formatFileSize(file.size);
 
     info.appendChild(name);
     info.appendChild(size);
-
-    const actions = document.createElement("div");
-    actions.className = "file-actions";
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "secondary";
-    button.textContent = "Download";
-    button.addEventListener("click", () => {
-      requestFileDownload(file.name);
-    });
-
-    actions.appendChild(button);
     item.appendChild(info);
-    item.appendChild(actions);
+
+    if (!file.isPending) {
+      const actions = document.createElement("div");
+      actions.className = "file-actions";
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "secondary";
+      button.textContent = "Download";
+      button.addEventListener("click", () => {
+        requestFileDownload(file.name);
+      });
+
+      actions.appendChild(button);
+      item.appendChild(actions);
+    }
+
     fileListEl.appendChild(item);
   }
 }
@@ -472,6 +595,34 @@ function requestUploadTarget() {
   return promise;
 }
 
+async function resolveUploadTarget() {
+  const uploadUrl = buildServerHttpUrl(uploadEndpointPath);
+
+  if (uploadUrl) {
+    return {
+      endpoint: uploadEndpointPath,
+      fieldName: "file",
+      method: "POST",
+      url: uploadUrl
+    };
+  }
+
+  const negotiatedTarget = await requestUploadTarget();
+  const endpointPath = negotiatedTarget?.endpoint || uploadEndpointPath;
+  const negotiatedUploadUrl = buildServerHttpUrl(endpointPath);
+
+  if (!negotiatedUploadUrl) {
+    throw new Error("The file upload endpoint is not available yet.");
+  }
+
+  return {
+    endpoint: endpointPath,
+    fieldName: negotiatedTarget?.fieldName || "file",
+    method: negotiatedTarget?.method || "POST",
+    url: negotiatedUploadUrl
+  };
+}
+
 async function startDownloadFromUrl(downloadPath, fileName) {
   const downloadUrl = /^https?:\/\//i.test(downloadPath)
     ? downloadPath
@@ -518,35 +669,35 @@ async function uploadFiles(fileList) {
   const files = [...(fileList || [])].filter((file) => file instanceof File);
 
   if (files.length === 0) {
+    resetDropZoneState();
     return;
   }
 
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    setStatus("Connect to a LAN clipboard server before uploading files.", "error");
+  if (!buildServerHttpUrl(uploadEndpointPath) && (!socket || socket.readyState !== WebSocket.OPEN)) {
+    resetDropZoneState();
+    setStatus("No reachable file upload endpoint is available yet.", "error");
     return;
   }
 
   isUploading = true;
-  dropZoneEl.classList.add("dragover");
+  setDropZoneActive(true);
+  setDropZoneUploading(true, files.length === 1 ? files[0].name : `${files.length} files`);
+  const pendingRecords = addPendingUploads(files);
 
   try {
-    const uploadTarget = await requestUploadTarget();
-    const endpointPath = uploadTarget?.endpoint || uploadEndpointPath;
-    const fieldName = uploadTarget?.fieldName || "file";
-    const uploadUrl = buildServerHttpUrl(endpointPath);
+    const uploadTarget = await resolveUploadTarget();
+    const fieldName = uploadTarget.fieldName || "file";
 
-    if (!uploadUrl) {
-      throw new Error("The file upload endpoint is not available yet.");
-    }
-
-    for (const file of files) {
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      const pendingRecord = pendingRecords[index];
       const formData = new FormData();
       formData.append(fieldName, file, file.name);
 
       setStatus(`Uploading ${file.name}…`, "connecting");
 
-      const response = await window.fetch(uploadUrl, {
-        method: uploadTarget?.method || "POST",
+      const response = await window.fetch(uploadTarget.url, {
+        method: uploadTarget.method || "POST",
         body: formData
       });
 
@@ -559,16 +710,23 @@ async function uploadFiles(fileList) {
 
       applyFileConfig(payload.config);
       mergeFileRecord(payload.file.url ? payload.file : { ...payload.file, url: payload.url });
+      if (pendingRecord) {
+        removePendingUpload(pendingRecord.id);
+      }
       setStatus(`Uploaded ${payload.file.name}.`, "connected");
     }
 
     requestAvailableFiles();
   } catch (error) {
     console.error("Upload failed:", error);
+    for (const pendingRecord of pendingRecords) {
+      removePendingUpload(pendingRecord.id);
+    }
     setStatus(error.message || "Failed to upload file.", "error");
   } finally {
     isUploading = false;
-    dropZoneEl.classList.remove("dragover");
+    setDropZoneUploading(false);
+    resetDropZoneState();
     fileInputEl.value = "";
   }
 }
@@ -867,39 +1025,106 @@ function preventDragDefaults(event) {
   event.stopPropagation();
 }
 
+function isDropZoneTarget(target) {
+  return Boolean(target) && (target === dropZoneEl || dropZoneEl.contains(target));
+}
+
+function extractDroppedFiles(dataTransfer) {
+  if (!dataTransfer) {
+    return [];
+  }
+
+  if (dataTransfer.items?.length) {
+    return [...dataTransfer.items]
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter((file) => file instanceof File);
+  }
+
+  return [...(dataTransfer.files || [])].filter((file) => file instanceof File);
+}
+
+for (const eventName of ["dragenter", "dragover", "drop"]) {
+  document.addEventListener(eventName, (event) => {
+    if (eventIncludesFiles(event)) {
+      preventDragDefaults(event);
+    }
+  });
+}
+
 for (const eventName of ["dragenter", "dragover", "dragleave", "drop"]) {
-  dropZoneEl.addEventListener(eventName, preventDragDefaults);
+  dropZoneEl.addEventListener(eventName, (event) => {
+    if (eventIncludesFiles(event)) {
+      preventDragDefaults(event);
+    }
+  });
 }
 
 for (const eventName of ["dragenter", "dragover"]) {
-  dropZoneEl.addEventListener(eventName, () => {
-    if (!isUploading) {
-      dropZoneEl.classList.add("dragover");
+  dropZoneEl.addEventListener(eventName, (event) => {
+    if (!eventIncludesFiles(event) || isUploading) {
+      return;
+    }
+
+    if (eventName === "dragenter") {
+      dropZoneDragDepth += 1;
+    }
+
+    setDropZoneActive(true);
+
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "copy";
     }
   });
 }
 
 for (const eventName of ["dragleave", "drop"]) {
-  dropZoneEl.addEventListener(eventName, () => {
-    if (!isUploading) {
-      dropZoneEl.classList.remove("dragover");
+  dropZoneEl.addEventListener(eventName, (event) => {
+    if (!eventIncludesFiles(event) || isUploading) {
+      return;
+    }
+
+    if (eventName === "dragleave") {
+      const relatedTarget = event.relatedTarget;
+
+      if (relatedTarget && isDropZoneTarget(relatedTarget)) {
+        return;
+      }
+
+      dropZoneDragDepth = Math.max(0, dropZoneDragDepth - 1);
+    } else {
+      dropZoneDragDepth = 0;
+    }
+
+    if (dropZoneDragDepth === 0) {
+      setDropZoneActive(false);
     }
   });
 }
 
 dropZoneEl.addEventListener("drop", (event) => {
-  uploadFiles(event.dataTransfer?.files || []);
+  if (!eventIncludesFiles(event)) {
+    return;
+  }
+
+  dropZoneDragDepth = 0;
+  uploadFiles(extractDroppedFiles(event.dataTransfer));
 });
 
 dropZoneEl.addEventListener("click", (event) => {
-  if (event.target === fileInputButtonEl) {
+  if (isUploading || event.target.closest("button")) {
     return;
   }
 
   fileInputEl.click();
 });
 
-fileInputButtonEl.addEventListener("click", () => {
+fileInputButtonEl.addEventListener("click", (event) => {
+  if (isUploading) {
+    return;
+  }
+
+  event.stopPropagation();
   fileInputEl.click();
 });
 
@@ -955,6 +1180,8 @@ serverHostEl.addEventListener("keydown", (event) => {
 serverHostEl.value = getInitialServerHost();
 lastRequestedManualHost = serverHostEl.value.trim();
 updateInputState();
+dropZoneBaseText = getDropZoneMessageEl()?.textContent?.trim() || "Drag & drop files here or";
+setDropZoneUploading(false);
 renderFileList();
 connect({
   mode: serverHostEl.value.trim() ? "manual" : "auto",

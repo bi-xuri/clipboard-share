@@ -9,22 +9,41 @@
   <body>
     <main class="popup">
       <h1>LAN Clipboard Sync</h1>
-      
+
       <div class="server-config">
         <label for="serverUrl">Manual WebSocket fallback</label>
-        <input type="text" id="serverUrl" placeholder="ws://clipboard-share.local:8080, 192.168.1.10, or mac-mini.local">
-        <button id="saveServerUrl" type="button">Save Fallback</button>
+        <div class="server-config-row">
+          <input type="text" id="serverUrl" placeholder="ws://clipboard-share.local:8080, 192.168.1.10, or mac-mini.local">
+          <button id="saveServerUrl" type="button">Save Fallback</button>
+        </div>
       </div>
       <p class="status">Leave the field blank to let the extension prefer <code>clipboard-share.local</code> and LAN discovery automatically.</p>
 
       <p id="status" class="status">Connecting...</p>
-      <label for="clipboardText">Shared text</label>
-      <textarea id="clipboardText" rows="8" placeholder="Clipboard text appears here"></textarea>
-      <div class="buttons">
-        <button id="syncFromClipboard" type="button">Sync From Local</button>
-        <button id="pushToServer" type="button">Push To Server</button>
-        <button id="copyFromServer" type="button">Copy From Server</button>
+
+      <div class="tabs" role="tablist" aria-label="Sharing views">
+        <button id="clipboardTab" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="clipboardPanel">Clipboard</button>
+        <button id="filesTab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="filesPanel">Files</button>
       </div>
+
+      <section id="clipboardPanel" class="panel is-active" role="tabpanel" aria-labelledby="clipboardTab">
+        <label for="clipboardText">Shared text</label>
+        <textarea id="clipboardText" rows="8" placeholder="Clipboard text appears here"></textarea>
+        <div class="buttons">
+          <button id="syncFromClipboard" type="button">Sync From Local</button>
+          <button id="pushToServer" type="button">Push To Server</button>
+          <button id="copyFromServer" type="button">Copy From Server</button>
+        </div>
+      </section>
+
+      <section id="filesPanel" class="panel" role="tabpanel" aria-labelledby="filesTab" hidden>
+        <div class="section-header">
+          <label class="section-title" for="fileList">Shared files</label>
+          <button id="refreshFiles" class="secondary-button" type="button">Refresh</button>
+        </div>
+        <ul id="fileList" class="file-list" aria-live="polite"></ul>
+      </section>
+
       <p id="updatedAt" class="updated-at"></p>
     </main>
     <script type="module" src="popup.js"></script>
