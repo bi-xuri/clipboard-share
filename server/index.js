@@ -12,15 +12,254 @@ const MDNS_SERVICE_TYPE = `_${MDNS_BONJOUR_TYPE}._tcp.local`;
 const MDNS_DEFAULT_HOSTNAME = "clipboard-share.local";
 const DISCOVERY_MAGIC = "lan-clipboard-discovery";
 const WEB_ROOT = path.resolve(__dirname, "../web");
+const UPLOADS_DIR = path.resolve(__dirname, "uploads");
+const MAX_FILE_SIZE = 100 * 1024 * 1024;
+const MAX_MULTIPART_BODY_SIZE = MAX_FILE_SIZE + 1024 * 1024;
+const MAX_FILENAME_LENGTH = 255;
+const HEADER_SEPARATOR = Buffer.from("\r\n\r\n");
+const FILE_PATH_PREFIX = "/files/";
+
+ensureDirectory(UPLOADS_DIR);
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
   ".js": "application/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".pdf": "application/pdf",
   ".png": "image/png",
-  ".svg": "image/svg+xml"
+  ".svg": "image/svg+xml",
+  ".txt": "text/plain; charset=utf-8",
+  ".webp": "image/webp"
 };
+
+function ensureDirectory(directoryPath) {
+  if (!fs.existsSync(directoryPath)) {
+    fs.mkdirSync(directoryPath, { recursive: true });
+  }
+}
+
+function createHttpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function getMimeType(fileName, fallback = "application/octet-stream") {
+  return mimeTypes[path.extname(fileName).toLowerCase()] || fallback;
+}
+
+function sanitizeUploadedName(input) {
+  const value = String(input || "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim();
+  const baseName = path.basename(value);
+
+  if (!baseName || baseName === "." || baseName === "..") {
+    return null;
+  }
+
+  const sanitized = baseName
+    .replace(/[<>:"/\\|?*]+/g, "-")
+    .replace(/^\.+/, "")
+    .replace(/\s+/g, " ")
+    .slice(0, MAX_FILENAME_LENGTH)
+    .trim();
+
+  return sanitized || null;
+}
+
+function parseMultipartBoundary(contentType) {
+  const match = String(contentType || "").match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+  return match ? (match[1] || match[2]).trim() : null;
+}
+
+function parseContentDisposition(headerValue) {
+  const parameters = {};
+
+  for (const part of String(headerValue || "").split(";").slice(1)) {
+    const [rawKey, ...rawValueParts] = part.split("=");
+    const key = rawKey ? rawKey.trim().toLowerCase() : "";
+
+    if (!key) {
+      continue;
+    }
+
+    const rawValue = rawValueParts.join("=").trim();
+    parameters[key] = rawValue.startsWith("\"") && rawValue.endsWith("\"")
+      ? rawValue.slice(1, -1)
+      : rawValue;
+  }
+
+  return parameters;
+}
+
+function parseMultipartFile(body, boundary) {
+  const boundaryBuffer = Buffer.from(`--${boundary}`);
+
+  if (!body.subarray(0, boundaryBuffer.length).equals(boundaryBuffer)) {
+    throw createHttpError(400, "Malformed multipart payload");
+  }
+
+  let position = boundaryBuffer.length;
+  let foundFile = null;
+  let filePartCount = 0;
+
+  while (position < body.length) {
+    if (body[position] === 45 && body[position + 1] === 45) {
+      break;
+    }
+
+    if (body[position] !== 13 || body[position + 1] !== 10) {
+      throw createHttpError(400, "Malformed multipart payload");
+    }
+
+    position += 2;
+
+    const headersEnd = body.indexOf(HEADER_SEPARATOR, position);
+
+    if (headersEnd === -1) {
+      throw createHttpError(400, "Malformed multipart payload");
+    }
+
+    const headers = body.subarray(position, headersEnd).toString("utf8");
+    const dataStart = headersEnd + HEADER_SEPARATOR.length;
+    const nextBoundary = body.indexOf(Buffer.from(`\r\n--${boundary}`), dataStart);
+
+    if (nextBoundary === -1) {
+      throw createHttpError(400, "Malformed multipart payload");
+    }
+
+    const content = body.subarray(dataStart, nextBoundary);
+    position = nextBoundary + 2 + boundaryBuffer.length;
+
+    const headerMap = {};
+
+    for (const line of headers.split("\r\n")) {
+      const separatorIndex = line.indexOf(":");
+
+      if (separatorIndex === -1) {
+        continue;
+      }
+
+      const key = line.slice(0, separatorIndex).trim().toLowerCase();
+      const value = line.slice(separatorIndex + 1).trim();
+      headerMap[key] = value;
+    }
+
+    const disposition = parseContentDisposition(headerMap["content-disposition"]);
+    const originalName = disposition.filename;
+
+    if (originalName !== undefined) {
+      filePartCount += 1;
+
+      if (filePartCount > 1) {
+        throw createHttpError(400, "Only one file can be uploaded per request");
+      }
+
+      foundFile = {
+        fieldName: disposition.name || "file",
+        originalName,
+        contentType: headerMap["content-type"] || getMimeType(originalName),
+        buffer: content
+      };
+    }
+
+    if (body[position] === 45 && body[position + 1] === 45) {
+      break;
+    }
+  }
+
+  if (!foundFile) {
+    throw createHttpError(400, "Multipart request did not include a file");
+  }
+
+  if (foundFile.buffer.length > MAX_FILE_SIZE) {
+    throw createHttpError(413, "Uploaded file exceeds size limit");
+  }
+
+  return foundFile;
+}
+
+function readRequestBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalLength = 0;
+
+    req.on("data", (chunk) => {
+      totalLength += chunk.length;
+
+      if (totalLength > limit) {
+        reject(createHttpError(413, "Request body too large"));
+        req.destroy();
+        return;
+      }
+
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => {
+      resolve(Buffer.concat(chunks));
+    });
+
+    req.on("error", (error) => {
+      reject(error);
+    });
+
+    req.on("aborted", () => {
+      reject(createHttpError(400, "Request aborted"));
+    });
+  });
+}
+
+function formatUploadTime(stats) {
+  const timestamp = stats.birthtimeMs > 0 ? stats.birthtime : stats.mtime;
+  return timestamp.toISOString();
+}
+
+function buildStoredFileMetadata(fileName, stats, contentType) {
+  return {
+    name: fileName,
+    size: stats.size,
+    type: contentType || getMimeType(fileName),
+    uploadTime: formatUploadTime(stats)
+  };
+}
+
+function getRequestedFileName(rawName) {
+  let decodedName;
+
+  try {
+    decodedName = decodeURIComponent(String(rawName || ""));
+  } catch (error) {
+    return null;
+  }
+
+  if (!decodedName || decodedName.includes("\0")) {
+    return null;
+  }
+
+  const normalized = path.basename(decodedName);
+
+  if (normalized !== decodedName) {
+    return null;
+  }
+
+  return sanitizeUploadedName(normalized);
+}
+
+function getContentLength(req) {
+  const header = req.headers["content-length"];
+
+  if (header === undefined) {
+    return null;
+  }
+
+  const parsed = Number(header);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : NaN;
+}
 
 function getLanAddresses() {
   const interfaces = require("os").networkInterfaces();
@@ -92,7 +331,7 @@ function sendStaticFile(res, requestPath) {
   const relativePath = parsedUrl.pathname === "/" ? "/index.html" : parsedUrl.pathname;
   const resolvedPath = path.resolve(WEB_ROOT, `.${relativePath}`);
 
-  if (!resolvedPath.startsWith(WEB_ROOT)) {
+  if (!resolvedPath.startsWith(`${WEB_ROOT}${path.sep}`) && resolvedPath !== WEB_ROOT) {
     res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("Forbidden");
     return;
@@ -231,24 +470,179 @@ function createApp(options = {}) {
   let nextClientId = 1;
   let resolvedHttpPort = configuredPort;
 
-  const udpDiscoveryResponder = createUdpDiscoveryResponder({
-    host,
-    discoveryPort: configuredDiscoveryPort,
-    getHttpPort: () => resolvedHttpPort
-  });
-  const mdnsAdvertiser = createMdnsAdvertiser({
-    hostname: mdnsHostname,
-    serviceName: mdnsServiceName,
-    getHttpPort: () => resolvedHttpPort
-  });
+  const fileMetadata = new Map();
 
-  const server = http.createServer((req, res) => {
-    if (req.url === "/health") {
+  function syncStoredFiles() {
+    ensureDirectory(UPLOADS_DIR);
+
+    const seenFileNames = new Set();
+    const entries = fs.readdirSync(UPLOADS_DIR, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      const fileName = entry.name;
+      const filePath = path.resolve(UPLOADS_DIR, fileName);
+      const stats = fs.statSync(filePath);
+      const existing = fileMetadata.get(fileName);
+
+      fileMetadata.set(fileName, buildStoredFileMetadata(fileName, stats, existing?.type));
+      seenFileNames.add(fileName);
+    }
+
+    for (const fileName of fileMetadata.keys()) {
+      if (!seenFileNames.has(fileName)) {
+        fileMetadata.delete(fileName);
+      }
+    }
+  }
+
+  function listAvailableFiles() {
+    syncStoredFiles();
+
+    return [...fileMetadata.values()].sort(
+      (left, right) => new Date(right.uploadTime).getTime() - new Date(left.uploadTime).getTime()
+    );
+  }
+
+  function resolveStoredFilePath(fileName) {
+    const resolvedPath = path.resolve(UPLOADS_DIR, fileName);
+
+    if (!resolvedPath.startsWith(`${UPLOADS_DIR}${path.sep}`)) {
+      throw createHttpError(400, "Invalid file name");
+    }
+
+    return resolvedPath;
+  }
+
+  function getDownloadUrl(fileName) {
+    return `${FILE_PATH_PREFIX}${encodeURIComponent(fileName)}`;
+  }
+
+  function findFileMetadata(fileName) {
+    syncStoredFiles();
+    return fileMetadata.get(fileName) || null;
+  }
+
+  function createUniqueFileName(originalName) {
+    const extension = path.extname(originalName);
+    const baseName = path.basename(originalName, extension);
+    let candidate = originalName;
+    let suffix = 1;
+
+    while (fs.existsSync(resolveStoredFilePath(candidate))) {
+      candidate = `${baseName} (${suffix})${extension}`;
+      suffix += 1;
+    }
+
+    return candidate;
+  }
+
+  async function handleFileUpload(req, res) {
+    const contentType = req.headers["content-type"];
+    const boundary = parseMultipartBoundary(contentType);
+    const contentLength = getContentLength(req);
+
+    if (!String(contentType || "").toLowerCase().startsWith("multipart/form-data") || !boundary) {
+      throw createHttpError(400, "Content-Type must be multipart/form-data with a boundary");
+    }
+
+    if (Number.isNaN(contentLength)) {
+      throw createHttpError(400, "Invalid Content-Length header");
+    }
+
+    if (contentLength !== null && contentLength > MAX_MULTIPART_BODY_SIZE) {
+      throw createHttpError(413, "Request body too large");
+    }
+
+    const body = await readRequestBody(req, MAX_MULTIPART_BODY_SIZE);
+    const file = parseMultipartFile(body, boundary);
+    const sanitizedName = sanitizeUploadedName(file.originalName);
+
+    if (!sanitizedName) {
+      throw createHttpError(400, "Invalid uploaded file name");
+    }
+
+    const storedName = createUniqueFileName(sanitizedName);
+    const filePath = resolveStoredFilePath(storedName);
+    let stats;
+
+    try {
+      fs.writeFileSync(filePath, file.buffer, { flag: "wx" });
+      stats = fs.statSync(filePath);
+    } catch (error) {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+
+      throw createHttpError(500, "Failed to store uploaded file");
+    }
+
+    const metadata = buildStoredFileMetadata(storedName, stats, file.contentType);
+    fileMetadata.set(storedName, metadata);
+
+    broadcast({
+      type: "fileUpload",
+      file: metadata,
+      url: getDownloadUrl(metadata.name)
+    });
+
+    sendJsonResponse(res, 201, {
+      ok: true,
+      file: metadata,
+      url: getDownloadUrl(metadata.name)
+    });
+  }
+
+  function handleFileList(res) {
+    sendJsonResponse(res, 200, listAvailableFiles());
+  }
+
+  function handleFileDownload(res, rawName) {
+    const requestedName = getRequestedFileName(rawName);
+
+    if (!requestedName) {
+      throw createHttpError(400, "Invalid file name");
+    }
+
+    const metadata = findFileMetadata(requestedName);
+
+    if (!metadata) {
+      throw createHttpError(404, "File not found");
+    }
+
+    const filePath = resolveStoredFilePath(metadata.name);
+    const stream = fs.createReadStream(filePath);
+
+    stream.on("error", () => {
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      }
+
+      res.end("Failed to read file");
+    });
+
+    res.writeHead(200, {
+      "Content-Length": metadata.size,
+      "Content-Type": metadata.type || "application/octet-stream",
+      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(metadata.name)}`,
+      "X-Content-Type-Options": "nosniff"
+    });
+
+    stream.pipe(res);
+  }
+
+  async function handleRequest(req, res) {
+    const parsedUrl = new URL(req.url || "/", "http://127.0.0.1");
+
+    if (req.method === "GET" && parsedUrl.pathname === "/health") {
       sendJsonResponse(res, 200, { ok: true, latestText, updatedAt });
       return;
     }
 
-    if (req.url === "/discovery") {
+    if (req.method === "GET" && parsedUrl.pathname === "/discovery") {
       sendJsonResponse(
         res,
         200,
@@ -264,7 +658,84 @@ function createApp(options = {}) {
       return;
     }
 
+    if (req.method === "POST" && parsedUrl.pathname === "/upload") {
+      await handleFileUpload(req, res);
+      return;
+    }
+
+    if (req.method === "GET" && parsedUrl.pathname === "/files") {
+      handleFileList(res);
+      return;
+    }
+
+    if (req.method === "GET" && parsedUrl.pathname.startsWith(FILE_PATH_PREFIX)) {
+      const rawName = parsedUrl.pathname.slice(FILE_PATH_PREFIX.length);
+
+      if (rawName) {
+        handleFileDownload(res, rawName);
+        return;
+      }
+    }
+
+    if (
+      req.method === "OPTIONS" &&
+      (
+        parsedUrl.pathname === "/upload" ||
+        parsedUrl.pathname === "/files" ||
+        parsedUrl.pathname.startsWith(FILE_PATH_PREFIX)
+      )
+    ) {
+      res.writeHead(204, {
+        "Access-Control-Allow-Methods": parsedUrl.pathname === "/upload" ? "POST, OPTIONS" : "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Content-Length": "0"
+      });
+      res.end();
+      return;
+    }
+
+    if (
+      parsedUrl.pathname === "/files" ||
+      parsedUrl.pathname === "/upload" ||
+      parsedUrl.pathname.startsWith(FILE_PATH_PREFIX)
+    ) {
+      res.writeHead(405, {
+        "Allow": parsedUrl.pathname === "/upload" ? "POST, OPTIONS" : "GET, OPTIONS",
+        "Content-Type": "application/json; charset=utf-8"
+      });
+      res.end(JSON.stringify({ ok: false, message: "Method not allowed" }));
+      return;
+    }
+
     sendStaticFile(res, req.url || "/");
+  }
+
+  const udpDiscoveryResponder = createUdpDiscoveryResponder({
+    host,
+    discoveryPort: configuredDiscoveryPort,
+    getHttpPort: () => resolvedHttpPort
+  });
+  const mdnsAdvertiser = createMdnsAdvertiser({
+    hostname: mdnsHostname,
+    serviceName: mdnsServiceName,
+    getHttpPort: () => resolvedHttpPort
+  });
+
+  const server = http.createServer((req, res) => {
+    handleRequest(req, res).catch((error) => {
+      const statusCode = Number(error?.statusCode) || 500;
+      const message = statusCode >= 500 ? "Internal server error" : error.message;
+
+      if (!res.headersSent) {
+        sendJsonResponse(res, statusCode, {
+          ok: false,
+          message
+        });
+        return;
+      }
+
+      res.end();
+    });
   });
 
   const wss = new WebSocketServer({ server });
@@ -306,6 +777,52 @@ function createApp(options = {}) {
     );
   }
 
+  function sendAvailableFiles(socket) {
+    sendJson(socket, {
+      type: "fileList",
+      files: listAvailableFiles().map((file) => ({
+        ...file,
+        url: getDownloadUrl(file.name)
+      }))
+    });
+  }
+
+  function sendFileDownload(socket, fileName) {
+    if (typeof fileName !== "string") {
+      sendJson(socket, {
+        type: "error",
+        message: "Invalid file name"
+      });
+      return;
+    }
+
+    const requestedName = getRequestedFileName(fileName);
+
+    if (!requestedName) {
+      sendJson(socket, {
+        type: "error",
+        message: "Invalid file name"
+      });
+      return;
+    }
+
+    const metadata = findFileMetadata(requestedName);
+
+    if (!metadata) {
+      sendJson(socket, {
+        type: "error",
+        message: "File not found"
+      });
+      return;
+    }
+
+    sendJson(socket, {
+      type: "fileDownload",
+      file: metadata,
+      url: getDownloadUrl(metadata.name)
+    });
+  }
+
   wss.on("connection", (socket, req) => {
     socket.clientId = nextClientId;
     nextClientId += 1;
@@ -344,6 +861,30 @@ function createApp(options = {}) {
         return;
       }
 
+      if (message.type === "fileList") {
+        sendAvailableFiles(socket);
+        return;
+      }
+
+      if (message.type === "fileDownload") {
+        sendFileDownload(socket, message.name);
+        return;
+      }
+
+      if (message.type === "fileUpload") {
+        sendJson(socket, {
+          type: "fileUpload",
+          ok: true,
+          upload: {
+            endpoint: "/upload",
+            method: "POST",
+            contentType: "multipart/form-data",
+            maxFileSize: MAX_FILE_SIZE
+          }
+        });
+        return;
+      }
+
       sendJson(socket, {
         type: "error",
         message: "Unsupported message type"
@@ -358,6 +899,8 @@ function createApp(options = {}) {
   });
 
   async function start() {
+    syncStoredFiles();
+
     await new Promise((resolve) => {
       server.listen(configuredPort, host, () => {
         const address = server.address();
